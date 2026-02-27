@@ -87,7 +87,7 @@ public sealed class HftEngine : IDisposable
     private double _threshold = 1.5;
     private double _lotSize = 0.1;
     private double _calibrationAlpha = 0.001;
-    private double _maxDeviationPoints = 1.0;
+    private double _maxDeviationPoints = 2.0;
     private int _maxHoldTimeMs = DefaultMaxHoldTimeMs;
 
     private long _ticksThisSecond;
@@ -127,8 +127,14 @@ public sealed class HftEngine : IDisposable
         Volatile.Write(ref _maxHoldTimeMs, holdMs);
 
         var deviation = config.MaxDeviationPoints;
-        if (deviation < 0) deviation = 0;
-        if (deviation > 1) deviation = 1;
+        if (double.IsNaN(deviation) || double.IsInfinity(deviation) || deviation < 0.0)
+        {
+            deviation = 0.0;
+        }
+        else if (deviation > 50.0)
+        {
+            deviation = 50.0;
+        }
         Interlocked.Exchange(ref _maxDeviationPoints, deviation);
     }
 
@@ -401,6 +407,15 @@ public sealed class HftEngine : IDisposable
 
         if (status == NexusMmfLayout.ReportStatusAccepted)
         {
+            if (_state == EngineState.InPosition || _exitRequested)
+            {
+                if (ticket > 0)
+                {
+                    _positionTicket = ticket;
+                }
+                return;
+            }
+
             _state = EngineState.WaitingFill;
             if (side != 0)
             {
@@ -436,6 +451,7 @@ public sealed class HftEngine : IDisposable
 
         if (status == NexusMmfLayout.ReportStatusRejected)
         {
+            var wasWaitingFill = _state == EngineState.WaitingFill;
             _entrySignalUs = 0;
             _cooldownUntilUs = NowMonoUs() + CooldownUs;
             if (_state == EngineState.InPosition || _exitRequested)
@@ -452,6 +468,11 @@ public sealed class HftEngine : IDisposable
                 _positionTicket = 0;
                 _positionOpenUs = 0;
                 _exitRequested = false;
+            }
+
+            if (wasWaitingFill)
+            {
+                Log?.Invoke("[HFT] Entry REJECTED (IOC Canceled) - Cooldown activated.");
             }
             return;
         }
