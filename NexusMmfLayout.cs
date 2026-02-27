@@ -23,6 +23,7 @@ public static class NexusMmfLayout
     public const long SignalSideOffset = 12;
     public const long SignalLotsOffset = 16;
     // Compact signal layout keeps MMF at 256 bytes without overlapping report/tick slots.
+    // SL/TP slots are reserved for layout compatibility; exits are managed virtually in HftEngine.
     public const long SignalSlOffset = 24;
     public const long SignalTpOffset = 32;
     public const long SignalReferenceOffset = 40;
