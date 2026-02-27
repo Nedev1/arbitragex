@@ -4,12 +4,10 @@ public sealed class EngineConfig
 {
     public double LotSize { get; set; }
     public double MaxSpread { get; set; }
-    public double TriggerThreshold { get; set; }
+    public double TriggerThreshold { get; set; } = 1.5;
     public double HardStopLoss { get; set; }
     public double CalibrationAlpha { get; set; } = 0.001;
-    public int MaxHoldTimeMs { get; set; } = 1500;
-    public double VirtualStopLoss { get; set; } = 5.0;
-    public double VirtualTakeProfit { get; set; } = 5.0;
+    public int MaxHoldTimeMs { get; set; } = 3000;
     public bool UseRithmic { get; set; }
     public string? RithmicUsername { get; set; }
     public string? RithmicPassword { get; set; }

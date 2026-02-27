@@ -19,7 +19,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private string _lotSize = "0.1";
     private string _maxSpread = "2.0";
-    private string _triggerThreshold = "0.5";
+    private string _triggerThreshold = "1.5";
     private string _hardStopLoss = "5.0";
     private bool _useRithmic;
     private string _rithmicUsername = string.Empty;
@@ -95,12 +95,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             LotSize = ParseDouble(LotSize, 0.1),
             MaxSpread = ParseDouble(MaxSpread, 2.0),
-            TriggerThreshold = ParseDouble(TriggerThreshold, 0.5),
+            TriggerThreshold = ParseDouble(TriggerThreshold, 1.5),
             HardStopLoss = ParseDouble(HardStopLoss, 5.0),
             CalibrationAlpha = 0.001,
-            MaxHoldTimeMs = 1500,
-            VirtualStopLoss = ParseDouble(HardStopLoss, 5.0),
-            VirtualTakeProfit = ParseDouble(HardStopLoss, 5.0),
+            MaxHoldTimeMs = 3000,
             UseRithmic = UseRithmic,
             RithmicUsername = string.IsNullOrWhiteSpace(RithmicUsername) ? null : RithmicUsername.Trim(),
             RithmicPassword = string.IsNullOrWhiteSpace(RithmicPassword) ? null : RithmicPassword,
@@ -173,7 +171,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public double GetTriggerThreshold()
     {
-        return ParseDouble(TriggerThreshold, 0.5);
+        return ParseDouble(TriggerThreshold, 1.5);
     }
 
     private static double ParseDouble(string value, double fallback)

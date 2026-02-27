@@ -39,17 +39,9 @@ public sealed class HftEngine : IDisposable
         InPosition = 2
     }
 
-    private const int DefaultMaxHoldTimeMs = 1500;
-    private const int MinWaitFillMs = 250;
+    private const int DefaultMaxHoldTimeMs = 3000;
+    private const int EntryAckTimeoutMs = 1200;
     private const int Mt5RetcodeDone = 10009;
-
-    private const string LogSignalBuy = "HFT_SIGNAL_BUY";
-    private const string LogSignalSell = "HFT_SIGNAL_SELL";
-    private const string LogExitStop = "HFT_EXIT_VSL";
-    private const string LogExitTake = "HFT_EXIT_VTP";
-    private const string LogExitTime = "HFT_EXIT_TIMEOUT";
-    private const string LogFlat = "HFT_FLAT";
-    private const string LogKill = "HFT_KILL";
 
     private readonly object _lifecycleLock = new();
     private readonly MemoryMappedFile _mmf;
@@ -74,7 +66,10 @@ public sealed class HftEngine : IDisposable
     private double _emaOffset;
     private bool _emaInitialized;
     private bool _emaFrozen;
-    private double _calibratedEdge;
+
+    private double _buyEdge;
+    private double _sellEdge;
+    private double _currentGap;
 
     private bool _armedBuy;
     private bool _armedSell;
@@ -83,22 +78,18 @@ public sealed class HftEngine : IDisposable
     private int _pendingSide;
     private int _positionSide;
     private long _positionTicket;
-    private double _entryPrice;
     private long _entrySignalMs;
-    private long _entryOpenMs;
+    private long _positionOpenMs;
     private bool _exitRequested;
 
-    private double _threshold = 0.5;
+    private double _threshold = 1.5;
     private double _lotSize = 0.1;
     private double _calibrationAlpha = 0.001;
     private int _maxHoldTimeMs = DefaultMaxHoldTimeMs;
-    private double _virtualStopLoss = 5.0;
-    private double _virtualTakeProfit = 5.0;
 
     private long _ticksThisSecond;
     private long _tpsClockTick;
     private long _currentTps;
-    private double _currentGap;
 
     private volatile bool _tradingEnabled;
     private volatile bool _isEngineCalibrating;
@@ -122,18 +113,15 @@ public sealed class HftEngine : IDisposable
 
     public void UpdateConfig(EngineConfig config)
     {
-        Interlocked.Exchange(ref _threshold, config.TriggerThreshold > 0.0 ? config.TriggerThreshold : 0.0);
         Interlocked.Exchange(ref _lotSize, config.LotSize > 0.0 ? config.LotSize : 0.1);
+        Interlocked.Exchange(ref _threshold, config.TriggerThreshold > 0.0 ? config.TriggerThreshold : 1.5);
 
         var alpha = config.CalibrationAlpha > 0.0 ? config.CalibrationAlpha : 0.001;
         if (alpha > 1.0) alpha = 1.0;
         Interlocked.Exchange(ref _calibrationAlpha, alpha);
 
-        var maxHold = config.MaxHoldTimeMs > 0 ? config.MaxHoldTimeMs : DefaultMaxHoldTimeMs;
-        Volatile.Write(ref _maxHoldTimeMs, maxHold);
-
-        Interlocked.Exchange(ref _virtualStopLoss, config.VirtualStopLoss > 0.0 ? config.VirtualStopLoss : 0.0);
-        Interlocked.Exchange(ref _virtualTakeProfit, config.VirtualTakeProfit > 0.0 ? config.VirtualTakeProfit : 0.0);
+        var holdMs = config.MaxHoldTimeMs > 0 ? config.MaxHoldTimeMs : DefaultMaxHoldTimeMs;
+        Volatile.Write(ref _maxHoldTimeMs, holdMs);
     }
 
     public void Start()
@@ -210,10 +198,10 @@ public sealed class HftEngine : IDisposable
             return;
         }
 
-        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, _calibratedEdge);
-        _exitRequested = true;
+        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, _buyEdge >= _sellEdge ? _buyEdge : -_sellEdge);
         _tradingEnabled = false;
-        Log?.Invoke(LogKill);
+        _exitRequested = true;
+        Log?.Invoke("HFT_KILL_SWITCH");
     }
 
     public void Dispose()
@@ -235,17 +223,21 @@ public sealed class HftEngine : IDisposable
         _lastReportSeq = _view.ReadInt64(NexusMmfLayout.ExecutionReportOffset + NexusMmfLayout.ReportSeqOffset);
         _signalSeq = _view.ReadInt64(NexusMmfLayout.TradeSignalOffset + NexusMmfLayout.SignalSeqOffset);
 
-        _hasMaster = false;
-        _hasSlave = false;
         _masterBid = 0.0;
         _masterAsk = 0.0;
         _slaveBid = 0.0;
         _slaveAsk = 0.0;
+        _hasMaster = false;
+        _hasSlave = false;
 
         _emaOffset = 0.0;
         _emaInitialized = false;
         _emaFrozen = false;
-        _calibratedEdge = 0.0;
+        _isEngineCalibrating = true;
+
+        _buyEdge = 0.0;
+        _sellEdge = 0.0;
+        _currentGap = 0.0;
 
         _armedBuy = true;
         _armedSell = true;
@@ -254,17 +246,14 @@ public sealed class HftEngine : IDisposable
         _pendingSide = 0;
         _positionSide = 0;
         _positionTicket = 0;
-        _entryPrice = 0.0;
         _entrySignalMs = 0;
-        _entryOpenMs = 0;
+        _positionOpenMs = 0;
         _exitRequested = false;
 
-        _isEngineCalibrating = true;
         _tradingEnabled = true;
         _tpsClockTick = Stopwatch.GetTimestamp();
         _ticksThisSecond = 0;
         _currentTps = 0;
-        _currentGap = 0.0;
     }
 
     private void Loop(CancellationToken token)
@@ -273,38 +262,43 @@ public sealed class HftEngine : IDisposable
 
         while (!token.IsCancellationRequested)
         {
-            var anyWork = false;
-            anyWork |= TryReadMasterTick();
-            anyWork |= TryReadSlaveTick();
-            anyWork |= TryReadExecutionReport();
+            var any = false;
+            any |= TryReadMasterTick();
+            any |= TryReadSlaveTick();
+            any |= TryReadExecutionReport();
 
             if (_hasMaster && _hasSlave)
             {
-                _calibratedEdge = ComputeCalibratedEdge();
-                Interlocked.Exchange(ref _currentGap, _calibratedEdge);
-                UpdateArming(_calibratedEdge);
+                RecomputeModel();
+                UpdateArming();
 
                 var nowMs = NowMonoMs();
                 if (_state == EngineState.Flat)
                 {
                     if (_tradingEnabled)
                     {
-                        TryEnter(nowMs, _calibratedEdge);
+                        TryOpen(nowMs);
                     }
                 }
                 else if (_state == EngineState.WaitingFill)
                 {
-                    CheckWaitingFillTimeout(nowMs);
+                    if (_entrySignalMs > 0 && nowMs - _entrySignalMs >= EntryAckTimeoutMs)
+                    {
+                        _state = EngineState.Flat;
+                        _pendingSide = 0;
+                        _entrySignalMs = 0;
+                        _exitRequested = false;
+                    }
                 }
                 else
                 {
-                    CheckVirtualExit(nowMs);
+                    CheckExit(nowMs);
                 }
             }
 
             UpdateTpsClock();
 
-            if (anyWork)
+            if (any)
             {
                 spin.Reset();
             }
@@ -392,15 +386,14 @@ public sealed class HftEngine : IDisposable
         }
 
         _lastReportSeq = seq2;
-        ApplyReportState(status, side, ticket, fillPrice, errorCode);
+        ApplyReport(status, side, ticket, errorCode);
         ExecutionReportReceived?.Invoke(new HftExecutionReport(seq2, status, side, ticket, fillPrice, fillLots, timestamp, errorCode));
         return true;
     }
 
-    private void ApplyReportState(int status, int side, long ticket, double fillPrice, int errorCode)
+    private void ApplyReport(int status, int side, long ticket, int errorCode)
     {
-        if (errorCode == Mt5RetcodeDone &&
-            (status == NexusMmfLayout.ReportStatusNone || status == NexusMmfLayout.ReportStatusRejected))
+        if (errorCode == Mt5RetcodeDone && status <= NexusMmfLayout.ReportStatusRejected)
         {
             status = NexusMmfLayout.ReportStatusFilled;
         }
@@ -408,31 +401,21 @@ public sealed class HftEngine : IDisposable
         if (status == NexusMmfLayout.ReportStatusAccepted || status == NexusMmfLayout.ReportStatusFilled)
         {
             _state = EngineState.InPosition;
-            _exitRequested = false;
-
-            if (side == 0)
+            _positionSide = side != 0 ? side : (_pendingSide != 0 ? _pendingSide : _positionSide);
+            if (_positionSide == 0)
             {
-                side = _pendingSide != 0 ? _pendingSide : _positionSide;
+                _positionSide = 1;
             }
 
-            _positionSide = side;
             if (ticket > 0)
             {
                 _positionTicket = ticket;
             }
 
-            if (fillPrice > 0.0)
-            {
-                _entryPrice = fillPrice;
-            }
-            else if (_entryPrice <= 0.0)
-            {
-                _entryPrice = side > 0 ? _slaveAsk : _slaveBid;
-            }
-
             _entrySignalMs = 0;
             _pendingSide = 0;
-            _entryOpenMs = NowMonoMs();
+            _positionOpenMs = NowMonoMs();
+            _exitRequested = false;
             return;
         }
 
@@ -457,21 +440,14 @@ public sealed class HftEngine : IDisposable
                 _armedSell = false;
             }
 
-            ResetPositionState();
             _state = EngineState.Flat;
-            Log?.Invoke(LogFlat);
+            _pendingSide = 0;
+            _positionSide = 0;
+            _positionTicket = 0;
+            _entrySignalMs = 0;
+            _positionOpenMs = 0;
+            _exitRequested = false;
         }
-    }
-
-    private void ResetPositionState()
-    {
-        _positionSide = 0;
-        _positionTicket = 0;
-        _entryPrice = 0.0;
-        _entryOpenMs = 0;
-        _entrySignalMs = 0;
-        _pendingSide = 0;
-        _exitRequested = false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -481,209 +457,144 @@ public sealed class HftEngine : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double FastAbs(double v)
+    private static double FastAbs(double value)
     {
-        return v >= 0.0 ? v : -v;
+        return value >= 0.0 ? value : -value;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool ShouldEnterBuy(double edge, double threshold, bool armed)
+    private void RecomputeModel()
     {
-        return armed && edge > threshold;
+        var masterMid = (_masterBid + _masterAsk) * 0.5;
+        var slaveMid = (_slaveBid + _slaveAsk) * 0.5;
+        var rawOffset = masterMid - slaveMid;
+
+        if (!_emaInitialized)
+        {
+            _emaOffset = rawOffset;
+            _emaInitialized = true;
+            _emaFrozen = false;
+            _isEngineCalibrating = false;
+        }
+        else
+        {
+            var threshold = Interlocked.CompareExchange(ref _threshold, 0.0, 0.0);
+            var band = threshold > 0.0 ? (threshold * 0.4) : 0.0;
+            var diff = rawOffset - _emaOffset;
+            var absDiff = FastAbs(diff);
+            if (absDiff < band)
+            {
+                var alpha = Interlocked.CompareExchange(ref _calibrationAlpha, 0.0, 0.0);
+                _emaOffset = (_emaOffset * (1.0 - alpha)) + (rawOffset * alpha);
+                _emaFrozen = false;
+            }
+            else
+            {
+                _emaFrozen = true;
+            }
+        }
+
+        var expectedSlaveBid = _masterBid - _emaOffset;
+        var expectedSlaveAsk = _masterAsk - _emaOffset;
+
+        _buyEdge = expectedSlaveBid - _slaveAsk;
+        _sellEdge = _slaveBid - expectedSlaveAsk;
+
+        var signedDominant = _buyEdge >= _sellEdge ? _buyEdge : -_sellEdge;
+        Interlocked.Exchange(ref _currentGap, signedDominant);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool ShouldEnterSell(double edge, double threshold, bool armed)
+    private void UpdateArming()
     {
-        return armed && edge < -threshold;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool ShouldRearmBuy(double edge, bool armed)
-    {
-        return !armed && edge <= 0.0;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool ShouldRearmSell(double edge, bool armed)
-    {
-        return !armed && edge >= 0.0;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool ShouldFreeze(double absDeviation, double freezeBand)
-    {
-        return absDeviation > freezeBand;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void UpdateArming(double calibratedEdge)
-    {
-        if (ShouldRearmBuy(calibratedEdge, _armedBuy))
+        if (!_armedBuy && _buyEdge <= 0.0)
         {
             _armedBuy = true;
         }
 
-        if (ShouldRearmSell(calibratedEdge, _armedSell))
+        if (!_armedSell && _sellEdge <= 0.0)
         {
             _armedSell = true;
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private double ComputeCalibratedEdge()
-    {
-        var masterMid = (_masterBid + _masterAsk) * 0.5;
-        var slaveMid = (_slaveBid + _slaveAsk) * 0.5;
-        var rawGap = masterMid - slaveMid;
-
-        if (!_emaInitialized)
-        {
-            _emaOffset = rawGap;
-            _emaInitialized = true;
-            _emaFrozen = false;
-            _isEngineCalibrating = false;
-            return 0.0;
-        }
-
-        var threshold = Interlocked.CompareExchange(ref _threshold, 0.0, 0.0);
-        var freezeBand = threshold > 0.0 ? (threshold * 0.5) : 0.0;
-        var deviation = rawGap - _emaOffset;
-        var absDeviation = FastAbs(deviation);
-
-        if (_emaFrozen)
-        {
-            if (!ShouldFreeze(absDeviation, freezeBand))
-            {
-                _emaFrozen = false;
-                _emaOffset += Interlocked.CompareExchange(ref _calibrationAlpha, 0.0, 0.0) * deviation;
-            }
-        }
-        else
-        {
-            if (ShouldFreeze(absDeviation, freezeBand))
-            {
-                _emaFrozen = true;
-            }
-            else
-            {
-                _emaOffset += Interlocked.CompareExchange(ref _calibrationAlpha, 0.0, 0.0) * deviation;
-            }
-        }
-
-        return rawGap - _emaOffset;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void TryEnter(long nowMs, double calibratedEdge)
+    private void TryOpen(long nowMs)
     {
         var threshold = Interlocked.CompareExchange(ref _threshold, 0.0, 0.0);
-        if (ShouldEnterBuy(calibratedEdge, threshold, _armedBuy))
+
+        var canBuy = _armedBuy && _buyEdge >= threshold;
+        var canSell = _armedSell && _sellEdge >= threshold;
+        if (!canBuy && !canSell)
         {
-            WriteSignal(NexusMmfLayout.SignalCommandOpen, 1, calibratedEdge);
+            return;
+        }
+
+        if (canBuy && (!canSell || _buyEdge >= _sellEdge))
+        {
+            WriteSignal(NexusMmfLayout.SignalCommandOpen, 1, _buyEdge);
             _state = EngineState.WaitingFill;
             _pendingSide = 1;
             _entrySignalMs = nowMs;
-            _entryPrice = _slaveAsk;
             _exitRequested = false;
-            Log?.Invoke(LogSignalBuy);
+            LogEdge("HFT_ENTRY_BUY");
             return;
         }
 
-        if (ShouldEnterSell(calibratedEdge, threshold, _armedSell))
-        {
-            WriteSignal(NexusMmfLayout.SignalCommandOpen, -1, calibratedEdge);
-            _state = EngineState.WaitingFill;
-            _pendingSide = -1;
-            _entrySignalMs = nowMs;
-            _entryPrice = _slaveBid;
-            _exitRequested = false;
-            Log?.Invoke(LogSignalSell);
-        }
+        WriteSignal(NexusMmfLayout.SignalCommandOpen, -1, _sellEdge);
+        _state = EngineState.WaitingFill;
+        _pendingSide = -1;
+        _entrySignalMs = nowMs;
+        _exitRequested = false;
+        LogEdge("HFT_ENTRY_SELL");
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void CheckWaitingFillTimeout(long nowMs)
-    {
-        if (_entrySignalMs <= 0)
-        {
-            return;
-        }
-
-        var timeoutMs = Volatile.Read(ref _maxHoldTimeMs);
-        if (timeoutMs < MinWaitFillMs)
-        {
-            timeoutMs = MinWaitFillMs;
-        }
-
-        if (nowMs - _entrySignalMs >= timeoutMs)
-        {
-            _state = EngineState.Flat;
-            _pendingSide = 0;
-            _entrySignalMs = 0;
-            _exitRequested = false;
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void CheckVirtualExit(long nowMs)
+    private void CheckExit(long nowMs)
     {
         if (_exitRequested || _positionSide == 0)
         {
             return;
         }
 
-        var maxHoldMs = Volatile.Read(ref _maxHoldTimeMs);
-        if (maxHoldMs <= 0)
-        {
-            maxHoldMs = DefaultMaxHoldTimeMs;
-        }
-
-        if (_entryOpenMs > 0 && nowMs - _entryOpenMs >= maxHoldMs)
-        {
-            SendKill(LogExitTime);
-            return;
-        }
-
-        var stopLoss = Interlocked.CompareExchange(ref _virtualStopLoss, 0.0, 0.0);
-        var takeProfit = Interlocked.CompareExchange(ref _virtualTakeProfit, 0.0, 0.0);
-
         if (_positionSide > 0)
         {
-            if (takeProfit > 0.0 && _slaveBid >= _entryPrice + takeProfit)
+            if (_buyEdge <= 0.0)
             {
-                SendKill(LogExitTake);
+                SendKill("HFT_EXIT_BUY_EDGE");
                 return;
             }
-
-            if (stopLoss > 0.0 && _slaveBid <= _entryPrice - stopLoss)
+        }
+        else
+        {
+            if (_sellEdge <= 0.0)
             {
-                SendKill(LogExitStop);
+                SendKill("HFT_EXIT_SELL_EDGE");
+                return;
             }
-            return;
         }
 
-        if (takeProfit > 0.0 && _slaveAsk <= _entryPrice - takeProfit)
+        var holdMs = Volatile.Read(ref _maxHoldTimeMs);
+        if (holdMs <= 0)
         {
-            SendKill(LogExitTake);
-            return;
+            holdMs = DefaultMaxHoldTimeMs;
         }
 
-        if (stopLoss > 0.0 && _slaveAsk >= _entryPrice + stopLoss)
+        if (_positionOpenMs > 0 && nowMs - _positionOpenMs >= holdMs)
         {
-            SendKill(LogExitStop);
+            SendKill("HFT_EXIT_EMERGENCY_TIMEOUT");
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void SendKill(string logMessage)
+    private void SendKill(string logTag)
     {
-        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, _calibratedEdge);
+        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, _buyEdge >= _sellEdge ? _buyEdge : _sellEdge);
         _exitRequested = true;
-        Log?.Invoke(logMessage);
+        LogEdge(logTag);
     }
 
-    private void WriteSignal(int command, int side, double referenceValue)
+    private void WriteSignal(int command, int side, double reference)
     {
         var signalOffset = NexusMmfLayout.TradeSignalOffset;
         var lots = Interlocked.CompareExchange(ref _lotSize, 0.0, 0.0);
@@ -693,12 +604,26 @@ public sealed class HftEngine : IDisposable
         _view.Write(signalOffset + NexusMmfLayout.SignalLotsOffset, lots);
         _view.Write(signalOffset + NexusMmfLayout.SignalSlOffset, 0.0);
         _view.Write(signalOffset + NexusMmfLayout.SignalTpOffset, 0.0);
-        _view.Write(signalOffset + NexusMmfLayout.SignalReferenceOffset, referenceValue);
+        _view.Write(signalOffset + NexusMmfLayout.SignalReferenceOffset, reference);
         _view.Write(signalOffset + NexusMmfLayout.SignalSlaveBidOffset, _slaveBid);
         _view.Write(signalOffset + NexusMmfLayout.SignalSlaveAskOffset, _slaveAsk);
 
         var nextSeq = Interlocked.Increment(ref _signalSeq);
         _view.Write(signalOffset + NexusMmfLayout.SignalSeqOffset, nextSeq);
+    }
+
+    private void LogEdge(string tag)
+    {
+        Log?.Invoke(string.Concat(
+            tag,
+            " buyEdge=",
+            _buyEdge.ToString("F4"),
+            " sellEdge=",
+            _sellEdge.ToString("F4"),
+            " ema=",
+            _emaOffset.ToString("F4"),
+            " frozen=",
+            _emaFrozen ? "1" : "0"));
     }
 
     private void UpdateTpsClock()
