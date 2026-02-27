@@ -7,6 +7,7 @@ public sealed class EngineConfig
     public double TriggerThreshold { get; set; } = 1.5;
     public double HardStopLoss { get; set; }
     public double CalibrationAlpha { get; set; } = 0.001;
+    public double MaxDeviationPoints { get; set; } = 1.0;
     public int MaxHoldTimeMs { get; set; } = 3000;
     public bool UseRithmic { get; set; }
     public string? RithmicUsername { get; set; }

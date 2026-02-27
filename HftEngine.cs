@@ -40,8 +40,8 @@ public sealed class HftEngine : IDisposable
     }
 
     private const int DefaultMaxHoldTimeMs = 3000;
-    private const int EntryAckTimeoutMs = 1200;
     private const int Mt5RetcodeDone = 10009;
+    private const long CooldownUs = 1_000_000;
 
     private readonly object _lifecycleLock = new();
     private readonly MemoryMappedFile _mmf;
@@ -87,6 +87,7 @@ public sealed class HftEngine : IDisposable
     private double _threshold = 1.5;
     private double _lotSize = 0.1;
     private double _calibrationAlpha = 0.001;
+    private double _maxDeviationPoints = 1.0;
     private int _maxHoldTimeMs = DefaultMaxHoldTimeMs;
 
     private long _ticksThisSecond;
@@ -124,6 +125,11 @@ public sealed class HftEngine : IDisposable
 
         var holdMs = config.MaxHoldTimeMs > 0 ? config.MaxHoldTimeMs : DefaultMaxHoldTimeMs;
         Volatile.Write(ref _maxHoldTimeMs, holdMs);
+
+        var deviation = config.MaxDeviationPoints;
+        if (deviation < 0) deviation = 0;
+        if (deviation > 1) deviation = 1;
+        Interlocked.Exchange(ref _maxDeviationPoints, deviation);
     }
 
     public void Start()
@@ -200,10 +206,10 @@ public sealed class HftEngine : IDisposable
             return;
         }
 
-        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, _rawOffset - _emaOffset);
+        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, 0.0, _rawOffset - _emaOffset);
         _tradingEnabled = false;
         _exitRequested = true;
-        _cooldownUntilUs = NowMonoUs() + 500_000;
+        _cooldownUntilUs = NowMonoUs() + CooldownUs;
         Log?.Invoke("HFT_KILL_SWITCH");
     }
 
@@ -285,17 +291,7 @@ public sealed class HftEngine : IDisposable
                         TryOpen(nowUs);
                     }
                 }
-                else if (_state == EngineState.WaitingFill)
-                {
-                    if (_entrySignalUs > 0 && nowUs - _entrySignalUs >= (EntryAckTimeoutMs * 1000L))
-                    {
-                        _state = EngineState.Flat;
-                        _pendingSide = 0;
-                        _entrySignalUs = 0;
-                        _exitRequested = false;
-                    }
-                }
-                else
+                else if (_state == EngineState.InPosition)
                 {
                     CheckExit(nowUs);
                 }
@@ -403,7 +399,21 @@ public sealed class HftEngine : IDisposable
             status = NexusMmfLayout.ReportStatusFilled;
         }
 
-        if (status == NexusMmfLayout.ReportStatusAccepted || status == NexusMmfLayout.ReportStatusFilled)
+        if (status == NexusMmfLayout.ReportStatusAccepted)
+        {
+            _state = EngineState.WaitingFill;
+            if (side != 0)
+            {
+                _pendingSide = side;
+            }
+            if (ticket > 0)
+            {
+                _positionTicket = ticket;
+            }
+            return;
+        }
+
+        if (status == NexusMmfLayout.ReportStatusFilled)
         {
             _state = EngineState.InPosition;
             _positionSide = side != 0 ? side : (_pendingSide != 0 ? _pendingSide : _positionSide);
@@ -426,10 +436,23 @@ public sealed class HftEngine : IDisposable
 
         if (status == NexusMmfLayout.ReportStatusRejected)
         {
-            _state = EngineState.Flat;
-            _pendingSide = 0;
             _entrySignalUs = 0;
-            _exitRequested = false;
+            _cooldownUntilUs = NowMonoUs() + CooldownUs;
+            if (_state == EngineState.InPosition || _exitRequested)
+            {
+                _state = EngineState.InPosition;
+                _pendingSide = 0;
+                _exitRequested = false;
+            }
+            else
+            {
+                _state = EngineState.Flat;
+                _pendingSide = 0;
+                _positionSide = 0;
+                _positionTicket = 0;
+                _positionOpenUs = 0;
+                _exitRequested = false;
+            }
             return;
         }
 
@@ -454,7 +477,7 @@ public sealed class HftEngine : IDisposable
             _positionOpenUs = 0;
             if (wasPositionState)
             {
-                _cooldownUntilUs = NowMonoUs() + 500_000;
+                _cooldownUntilUs = NowMonoUs() + CooldownUs;
             }
             _exitRequested = false;
         }
@@ -536,6 +559,16 @@ public sealed class HftEngine : IDisposable
         }
 
         var threshold = Interlocked.CompareExchange(ref _threshold, 0.0, 0.0);
+        var spread = _slaveAsk - _slaveBid;
+        if (spread < 0.0)
+        {
+            spread = 0.0;
+        }
+
+        if (spread > (threshold * 2.0))
+        {
+            return;
+        }
 
         var canBuy = _armedBuy && _buyEdge >= threshold;
         var canSell = _armedSell && _sellEdge >= threshold;
@@ -546,7 +579,7 @@ public sealed class HftEngine : IDisposable
 
         if (canBuy && (!canSell || _buyEdge >= _sellEdge))
         {
-            WriteSignal(NexusMmfLayout.SignalCommandOpen, 1, _buyEdge);
+            WriteSignal(NexusMmfLayout.SignalCommandOpen, 1, _slaveAsk, _buyEdge);
             _state = EngineState.WaitingFill;
             _pendingSide = 1;
             _entrySignalUs = nowUs;
@@ -555,7 +588,7 @@ public sealed class HftEngine : IDisposable
             return;
         }
 
-        WriteSignal(NexusMmfLayout.SignalCommandOpen, -1, _sellEdge);
+        WriteSignal(NexusMmfLayout.SignalCommandOpen, -1, _slaveBid, _sellEdge);
         _state = EngineState.WaitingFill;
         _pendingSide = -1;
         _entrySignalUs = nowUs;
@@ -571,9 +604,17 @@ public sealed class HftEngine : IDisposable
             return;
         }
 
+        if (nowUs < _cooldownUntilUs)
+        {
+            return;
+        }
+
+        var threshold = Interlocked.CompareExchange(ref _threshold, 0.0, 0.0);
+        var hysteresis = threshold * 0.2;
+
         if (_positionSide > 0)
         {
-            if (_rawOffset <= _emaOffset)
+            if (_rawOffset <= _emaOffset - hysteresis)
             {
                 SendKill("HFT_EXIT_BUY_RAW", nowUs);
                 return;
@@ -581,7 +622,7 @@ public sealed class HftEngine : IDisposable
         }
         else
         {
-            if (_rawOffset >= _emaOffset)
+            if (_rawOffset >= _emaOffset + hysteresis)
             {
                 SendKill("HFT_EXIT_SELL_RAW", nowUs);
                 return;
@@ -603,22 +644,23 @@ public sealed class HftEngine : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void SendKill(string logTag, long nowUs)
     {
-        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, _rawOffset - _emaOffset);
+        WriteSignal(NexusMmfLayout.SignalCommandKill, 0, 0.0, _rawOffset - _emaOffset);
         _exitRequested = true;
-        _cooldownUntilUs = nowUs + 500_000;
+        _cooldownUntilUs = nowUs + CooldownUs;
         LogEdge(logTag);
     }
 
-    private void WriteSignal(int command, int side, double reference)
+    private void WriteSignal(int command, int side, double price, double reference)
     {
         var signalOffset = NexusMmfLayout.TradeSignalOffset;
         var lots = Interlocked.CompareExchange(ref _lotSize, 0.0, 0.0);
+        var deviation = Interlocked.CompareExchange(ref _maxDeviationPoints, 0.0, 0.0);
 
         _view.Write(signalOffset + NexusMmfLayout.SignalCommandOffset, command);
         _view.Write(signalOffset + NexusMmfLayout.SignalSideOffset, side);
         _view.Write(signalOffset + NexusMmfLayout.SignalLotsOffset, lots);
-        _view.Write(signalOffset + NexusMmfLayout.SignalSlOffset, 0.0);
-        _view.Write(signalOffset + NexusMmfLayout.SignalTpOffset, 0.0);
+        _view.Write(signalOffset + NexusMmfLayout.SignalPriceOffset, price);
+        _view.Write(signalOffset + NexusMmfLayout.SignalMaxDeviationOffset, deviation);
         _view.Write(signalOffset + NexusMmfLayout.SignalReferenceOffset, reference);
         _view.Write(signalOffset + NexusMmfLayout.SignalSlaveBidOffset, _slaveBid);
         _view.Write(signalOffset + NexusMmfLayout.SignalSlaveAskOffset, _slaveAsk);

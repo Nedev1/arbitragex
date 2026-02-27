@@ -98,6 +98,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             TriggerThreshold = ParseDouble(TriggerThreshold, 1.5),
             HardStopLoss = ParseDouble(HardStopLoss, 5.0),
             CalibrationAlpha = 0.001,
+            MaxDeviationPoints = 1.0,
             MaxHoldTimeMs = 3000,
             UseRithmic = UseRithmic,
             RithmicUsername = string.IsNullOrWhiteSpace(RithmicUsername) ? null : RithmicUsername.Trim(),
